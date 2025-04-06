@@ -73,7 +73,7 @@ function message_list_tooltip(target: string, props: Partial<tippy.Props> = {}):
 }
 
 // Defining observer outside ensures that at max only one observer is active at all times.
-let observer;
+let tooltip_observer: MutationObserver | undefined;
 function hide_tooltip_if_reference_removed(
     target_node: HTMLElement,
     config: Config,
@@ -106,8 +106,13 @@ function hide_tooltip_if_reference_removed(
             }
         }
     };
-    observer = new MutationObserver(callback);
-    observer.observe(target_node, config);
+    
+    // Make sure we disconnect any existing observer before creating a new one
+    if (tooltip_observer) {
+        tooltip_observer.disconnect();
+    }
+    tooltip_observer = new MutationObserver(callback);
+    tooltip_observer.observe(target_node, config);
 }
 
 // To prevent the appearance of tooltips whose reference is hidden or removed from the
@@ -121,6 +126,15 @@ export function destroy_all_message_list_tooltips(): void {
         instance.destroy();
     }
     message_list_tippy_instances.clear();
+    
+    // Make sure any active observers are disconnected
+    if (tooltip_observer) {
+        tooltip_observer.disconnect();
+        tooltip_observer = undefined;
+    }
+    
+    // Remove any mobile timestamp popovers that might be present
+    $(".mobile-timestamp-popover").remove();
 }
 
 function get_time_string(timestamp: number): string {
@@ -141,6 +155,93 @@ function get_time_string(timestamp: number): string {
     );
 }
 
+// Function to detect if the user is on a mobile device
+function isMobileDevice(): boolean {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+}
+
+// Function to get full timestamp text for a message
+function getFullTimestampText(message: any): string {
+    if (!message || message.locally_echoed) {
+        return "";
+    }
+    const time = new Date(message.timestamp * 1000);
+    return timerender.get_full_datetime_clarification(time);
+}
+
+// Function to create and show the mobile timestamp popover
+function showMobileTimestampPopover($target: JQuery, message: any): void {
+    // First, remove any existing popover
+    $(".mobile-timestamp-popover").remove();
+    
+    const fullTimeText = getFullTimestampText(message);
+    if (!fullTimeText) {
+        return;
+    }
+    
+    const $popover = $("<div>")
+        .addClass("mobile-timestamp-popover")
+        .html(fullTimeText)
+        .css({
+            position: "fixed",
+            zIndex: 1000,
+            background: "rgba(40, 40, 40, 0.95)",
+            color: "white",
+            borderRadius: "4px",
+            padding: "8px 12px",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.3)",
+            maxWidth: "300px",
+            wordWrap: "break-word",
+            fontSize: "14px",
+            textAlign: "center"
+        });
+    
+    // Position the popover in the center of the screen for better visibility on small screens
+    const windowWidth = $(window).width()!;
+    const windowHeight = $(window).height()!;
+    
+    $popover.appendTo("body").css({
+        top: windowHeight / 2 - 50,
+        left: windowWidth / 2 - 150,
+        width: "300px",
+    });
+    
+    // Add a dismiss button to prevent accidental dismissal when scrolling
+    const $dismissButton = $("<button>")
+        .text("Dismiss")
+        .css({
+            marginTop: "8px",
+            padding: "4px 12px",
+            background: "rgba(255, 255, 255, 0.2)",
+            border: "none",
+            borderRadius: "4px",
+            color: "white",
+            cursor: "pointer",
+            display: "block",
+            width: "100%"
+        });
+        
+    $dismissButton.on("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        $popover.remove();
+    });
+    
+    $popover.append($dismissButton);
+    
+    // Prevent the popover from closing when touched/clicked
+    $popover.on("click touchstart", (e) => {
+        e.stopPropagation();
+    });
+    
+    // Close the popover after 6 seconds
+    setTimeout(() => {
+        $popover.fadeOut(200, () => {
+            $popover.remove();
+        });
+    }, 6000);
+}
+
 export function initialize(): void {
     message_list_tooltip(".tippy-narrow-tooltip", {
         delay: LONG_HOVER_DELAY,
@@ -152,7 +253,6 @@ export function initialize(): void {
     });
 
     // message reaction tooltip showing who reacted.
-    let observer: MutationObserver | undefined;
     message_list_tooltip(".message_reaction", {
         delay: INTERACTIVE_HOVER_DELAY,
         placement: "bottom",
@@ -183,9 +283,6 @@ export function initialize(): void {
         },
         onHidden(instance) {
             instance.destroy();
-            if (observer) {
-                observer.disconnect();
-            }
         },
     });
 
@@ -257,24 +354,6 @@ export function initialize(): void {
             const config = {attributes: true, childList: false, subtree: false};
             const nodes_to_check_for_removal = [$elem.get(0)!];
             hide_tooltip_if_reference_removed(target, config, instance, nodes_to_check_for_removal);
-        },
-        onHidden(instance) {
-            instance.destroy();
-        },
-    });
-
-    message_list_tooltip(".message-list .message-time", {
-        onShow(instance) {
-            const $time_elem = $(instance.reference);
-            const $row = $time_elem.closest(".message_row");
-            assert(message_lists.current !== undefined);
-            const message = message_lists.current.get(rows.id($row))!;
-            // Don't show time tooltip for locally echoed message.
-            if (message.locally_echoed) {
-                return false;
-            }
-            const time = new Date(message.timestamp * 1000);
-            instance.setContent(timerender.get_full_datetime_clarification(time));
             return undefined;
         },
         onHidden(instance) {
@@ -282,11 +361,84 @@ export function initialize(): void {
         },
     });
 
+    // Initialize improved timestamp handling
+    const setupMessageTimestamps = () => {
+        // For desktop: regular hover tooltip
+        if (!isMobileDevice()) {
+            message_list_tooltip(".message-list .message-time", {
+                onShow(instance) {
+                    const $time_elem = $(instance.reference);
+                    const $row = $time_elem.closest(".message_row");
+                    if (!message_lists.current) {
+                        return false;
+                    }
+                    const message = message_lists.current.get(rows.id($row));
+                    if (!message || message.locally_echoed) {
+                        return false;
+                    }
+                    const time = new Date(message.timestamp * 1000);
+                    instance.setContent(timerender.get_full_datetime_clarification(time));
+                    return undefined;
+                },
+                onHidden(instance) {
+                    instance.destroy();
+                },
+            });
+        } else {
+            // For mobile: short tap to show timestamp popover
+            // Using single tap instead of long press to avoid conflict with reply action
+            $(document).on("click", ".message-list .message-time", function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                const $time_elem = $(this);
+                const $row = $time_elem.closest(".message_row");
+                if (!message_lists.current) {
+                    return;
+                }
+                
+                const message = message_lists.current.get(rows.id($row));
+                showMobileTimestampPopover($time_elem, message);
+            });
+            
+            // Add mobile-specific CSS when the page loads
+            $("<style>")
+                .attr("id", "mobile-timestamp-styles")
+                .text(`
+                    @media (max-width: 768px) {
+                        /* Make timestamp text fully visible on mobile */
+                        .message-time {
+                            overflow: visible !important;
+                            max-width: none !important;
+                            white-space: normal !important;
+                            display: inline-block !important;
+                            touch-action: none; /* Prevents scrolling when touching timestamp */
+                        }
+                        /* Add visual indicator that timestamp is tappable */
+                        .message-time {
+                            text-decoration: underline dotted;
+                            cursor: pointer;
+                        }
+                        /* Make message content use all available space */
+                        .message_content {
+                            overflow: visible !important;
+                            grid-column-end: time !important;
+                        }
+                    }
+                `)
+                .appendTo("head");
+        }
+    };
+    
+    setupMessageTimestamps();
+
     message_list_tooltip(".disabled-message-edit-save", {
         onShow(instance) {
             const $elem = $(instance.reference);
             const $row = $elem.closest(".message_row");
-            assert($row !== undefined);
+            if ($row.length === 0) {
+                return false;
+            }
             instance.setContent(compose_validate.get_disabled_save_tooltip($row));
             return undefined;
         },
@@ -325,8 +477,13 @@ export function initialize(): void {
     );
 
     message_list_tooltip(".rendered_markdown time", {
-        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
-        content: timerender.get_markdown_time_tooltip as tippy.Content,
+        onShow(instance) {
+            if (typeof timerender.get_markdown_time_tooltip === "function") {
+                instance.setContent(timerender.get_markdown_time_tooltip(instance.reference));
+                return undefined;
+            }
+            return false;
+        },
         onHidden(instance) {
             instance.destroy();
         },
@@ -343,6 +500,7 @@ export function initialize(): void {
                 $(instance.reference).parent().attr("aria-label") ??
                 $(instance.reference).parent().attr("href");
             instance.setContent(parse_html(render_message_inline_image_tooltip({title})));
+            return undefined;
         },
         onHidden(instance) {
             instance.destroy();
@@ -358,6 +516,7 @@ export function initialize(): void {
             } else {
                 instance.setContent(parse_html($("#view-user-card-tooltip-template").html()));
             }
+            return undefined;
         },
         onHidden(instance) {
             instance.destroy();
